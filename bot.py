@@ -10,10 +10,13 @@ import uuid
 import aiohttp
 import time
 import re
+import unicodedata
+from difflib import SequenceMatcher
+from urllib.parse import urljoin, urlparse
 import psutil
 from curl_cffi.requests import AsyncSession
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
 # --- Configuration ---
@@ -197,15 +200,44 @@ def clean_filename(filename):
 
     return filename
 
+
+def normalize_search_text(value):
+    value = unicodedata.normalize('NFKD', str(value)).casefold()
+    value = ''.join(char for char in value if not unicodedata.combining(char))
+    return ' '.join(re.findall(r'[a-z0-9]+', value))
+
+
+def search_match_score(query, candidate):
+    query = normalize_search_text(query)
+    candidate = normalize_search_text(candidate)
+    if not query or not candidate:
+        return 0
+    if query == candidate:
+        return 100
+    if query in candidate or candidate in query:
+        return 95
+
+    ratio = SequenceMatcher(None, query, candidate).ratio() * 100
+    query_tokens = set(query.split())
+    candidate_tokens = set(candidate.split())
+    coverage = len(query_tokens & candidate_tokens) / len(query_tokens) * 100
+    return max(ratio, coverage)
+
+
 def is_dub_title(title):
     return bool(re.search(r'\bdub(?:bed|premium)?\b', title, flags=re.IGNORECASE))
 
 
 def variant_base_title(title):
     """Normalize Dub/Sub variants to the same title for pairing."""
-    title = re.sub(r'\[(?:dub|dubbed|sub|subbed)\]', '', title, flags=re.IGNORECASE)
-    title = re.sub(r'\b(?:dub|dubbed|sub|subbed)\b', '', title, flags=re.IGNORECASE)
-    return clean_filename(title).lower().strip(" -_")
+    title = re.sub(
+        r'[\[(]\s*(?:english\s+)?(?:dub|dubbed|dubpremium|sub|subbed)(?:\s+audio)?\s*[\])]',
+        '',
+        title,
+        flags=re.IGNORECASE
+    )
+    title = re.sub(r'\b(?:english\s+)?(?:dub|dubbed|dubpremium|sub|subbed)(?:\s+audio)?\b', '', title, flags=re.IGNORECASE)
+    return normalize_search_text(clean_filename(title))
 
 
 def find_dual_pairs(results):
@@ -226,16 +258,47 @@ def find_dual_pairs(results):
     return [group for group in grouped.values() if group['dub_id'] and group['sub_id']]
 
 
-def dual_choice_text(pairs, ep_arg=None):
-    episode = f" -e {ep_arg}" if ep_arg else ""
-    lines = ["🎬 **Dual audio is available**", "", "Choose which source you want for the video:", ""]
-    for index, pair in enumerate(pairs, 1):
-        if len(pairs) > 1:
-            lines.append(f"{index}. **{pair['title']}**")
-        lines.append(f"🎞 Sub video: `/dual {pair['dub_id']} {pair['sub_id']}{episode}`")
-        lines.append(f"🎞 Dub video: `/engvdiddual {pair['dub_id']} {pair['sub_id']}{episode}`")
-        lines.append("")
-    return "\n".join(lines).rstrip()
+def dual_choice_text(pairs):
+    if len(pairs) == 1:
+        return f"🎬 **{pairs[0]['title']}**\n\nChoose which source you want for the video:"
+    return "🎬 **Dual audio results**\n\nChoose a title and video source:"
+
+
+def dual_choice_markup(pairs, user_id, ep_arg=None):
+    episode = ep_arg or "_"
+    rows = []
+    for pair in pairs:
+        title = pair['title'][:24]
+        sub_label = "🇯🇵 Sub Video" if len(pairs) == 1 else f"🇯🇵 Sub: {title}"
+        dub_label = "🇬🇧 Dub Video" if len(pairs) == 1 else f"🇬🇧 Dub: {title}"
+        rows.append([
+            InlineKeyboardButton(
+                sub_label,
+                callback_data=f"dual|s|{pair['dub_id']}|{pair['sub_id']}|{episode}|{user_id}"
+            ),
+            InlineKeyboardButton(
+                dub_label,
+                callback_data=f"dual|d|{pair['dub_id']}|{pair['sub_id']}|{episode}|{user_id}"
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+def download_results_markup(results, command, user_id, ep_arg=None):
+    episode = ep_arg or "_"
+    rows = []
+    for result in results:
+        title = result.get('attributes', {}).get('name', 'Unknown')
+        result_id = result.get('id')
+        use_english = command == "engdl" or (command == "auto" and is_dub_title(title))
+        mode = "e" if use_english else "d"
+        rows.append([
+            InlineKeyboardButton(
+                f"Download: {title}"[:60],
+                callback_data=f"download|{mode}|{result_id}|{episode}|{user_id}"
+            )
+        ])
+    return InlineKeyboardMarkup(rows)
 
 
 def create_short_filename(series_name, episode_num, suffix):
@@ -400,26 +463,71 @@ class OCEANVEIL:
                 return False
 
     async def search_title(self, query):
+        if not self.auth_header and not await self.login():
+            return []
+
         session = await self.get_session()
+        url = "https://oceanveil.net/api/v1/anime_titles"
+        titles = []
+        seen_ids = set()
+
         try:
-            res = await session.get(
-                "https://oceanveil.net/api/v1/anime_titles",
-                headers={"authorization": self.auth_header} if self.auth_header else {}
-            )
-            if res.status_code == 200:
-                data = res.json().get('data', [])
-                # Filter locally since API search is broken
-                q = str(query).lower()
-                results = []
-                for item in data:
-                    name = item.get('attributes', {}).get('name', '')
-                    promo = item.get('attributes', {}).get('promotionName', '') or ''
-                    if q in name.lower() or q in promo.lower():
-                        results.append(item)
-                return results
+            for _ in range(25):
+                res = await session.get(
+                    url,
+                    headers={"authorization": self.auth_header},
+                    cookies=self.cookies
+                )
+                if res.status_code in (401, 403):
+                    self.auth_header = None
+                    if not await self.login():
+                        return []
+                    res = await session.get(
+                        url,
+                        headers={"authorization": self.auth_header},
+                        cookies=self.cookies
+                    )
+                if res.status_code != 200:
+                    logger.error(f"Title search failed: {res.status_code}")
+                    return []
+
+                payload = res.json()
+                for item in payload.get('data', []):
+                    item_id = str(item.get('id', ''))
+                    if item_id and item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        titles.append(item)
+
+                next_url = (payload.get('links') or {}).get('next')
+                if not isinstance(next_url, str) or not next_url:
+                    break
+                next_url = urljoin(url, next_url)
+                if urlparse(next_url).hostname != "oceanveil.net":
+                    logger.warning("Ignored an unexpected pagination URL from the title API.")
+                    break
+                url = next_url
+
+            scored = []
+            for index, item in enumerate(titles):
+                attributes = item.get('attributes', {})
+                candidates = [
+                    attributes.get('name', ''),
+                    attributes.get('promotionName', '') or ''
+                ]
+                score = max(search_match_score(query, candidate) for candidate in candidates)
+                if score:
+                    scored.append((score, index, item))
+
+            scored.sort(key=lambda match: (-match[0], match[1]))
+            strong_matches = [item for score, _, item in scored if score >= 55]
+            if strong_matches:
+                return strong_matches[:30]
+
+            # Force-match the closest titles when no normal match exists.
+            return [item for _, _, item in scored[:15]]
         except Exception as e:
             logger.error(f"Search error: {e}")
-        return []
+            return []
 
     async def get_episodes(self, id):
         if not self.auth_header:
@@ -735,6 +843,9 @@ async def smart_dl_cmd(client, message: Message):
     if not query:
         await message.reply_text("Usage: /sdl <id/name> [-e ep/range]")
         return
+    if ep_arg and not re.fullmatch(r'\d+(?:-\d+)?', ep_arg):
+        await message.reply_text("❌ Invalid episode filter. Use: 5 or 1-5")
+        return
 
     status = await message.reply_text(f"🔍 Looking for Dub and Sub variants of '{query}'...")
     selected_id = query if query.isdigit() else None
@@ -759,34 +870,39 @@ async def smart_dl_cmd(client, message: Message):
         pairs = [pair for pair in pairs if selected_id in (pair['dub_id'], pair['sub_id'])]
 
     if pairs:
-        await status.edit(dual_choice_text(pairs[:15], ep_arg))
-        return
-
-    episode = f" -e {ep_arg}" if ep_arg else ""
-    if selected_id:
-        command = "engdl" if lang_code == "eng" else "dl"
+        pairs = pairs[:10]
         await status.edit(
-            "ℹ️ No matching Dub/Sub variant was found.\n\n"
-            f"📥 Download available version: `/{command} {selected_id}{episode}`"
+            dual_choice_text(pairs),
+            reply_markup=dual_choice_markup(pairs, message.from_user.id, ep_arg)
         )
         return
 
-    text = f"🔍 **Search Results for '{query}'**\n\n"
-    for index, result in enumerate(results[:15], 1):
-        title = result.get('attributes', {}).get('name', 'Unknown')
-        result_id = result.get('id')
-        command = "engdl" if is_dub_title(title) else "dl"
-        text += f"{index}. **{title}**\n"
-        text += f"└ 📥 Download: `/{command} {result_id}{episode}`\n\n"
-    text += "No matching Dub/Sub pair was found."
-    await status.edit(text)
+    if selected_id:
+        command = "engdl" if lang_code == "eng" else "dl"
+        fallback = [{
+            'id': selected_id,
+            'attributes': {'name': episodes[0]['series_name']}
+        }]
+        await status.edit(
+            "ℹ️ No matching Dub/Sub variant was found. You can download the available version:",
+            reply_markup=download_results_markup(fallback, command, message.from_user.id, ep_arg)
+        )
+        return
+
+    text = f"🔍 **Search Results for '{query}'**\n\nNo Dub/Sub pair was found. Choose a version to download."
+    await status.edit(
+        text,
+        reply_markup=download_results_markup(results[:15], "auto", message.from_user.id, ep_arg)
+    )
 
 
 @app.on_message(filters.command(["dl", "engdl"]))
-async def dl_cmd(client, message: Message):
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name
-    args = message.command
+async def dl_cmd(client, message: Message, args_override=None, user_override=None):
+    user = user_override or message.from_user
+    user_id = user.id
+    user_name = user.first_name
+    args = args_override or message.command
+    command_name = args[0].lower()
     
     if len(args) < 2:
         await message.reply_text("Usage: /dl <id/name> [-e ep/range]")
@@ -831,23 +947,12 @@ async def dl_cmd(client, message: Message):
             await status.edit(f"❌ No results found for '{aid}'.")
             return
             
-        if len(results) > 1:
-            # Show search results!
-            text = f"🔍 **Search Results for '{aid}'**\n\n"
-            for idx, r in enumerate(results[:15]):
-                name = r.get('attributes', {}).get('name', 'Unknown')
-                r_id = r.get('id')
-                # Determine command based on alias
-                cmd = message.command[0]
-                text += f"{idx+1}. **{name}**\n"
-                text += f"└ 📥 Download: `/{cmd} {r_id}`\n\n"
-            text += "Please click a download command above to start."
-            await status.edit(text)
-            return
-            
-        # If exactly 1 result, proceed with it
-        aid = results[0]['id']
-        await status.edit(f"✅ Found exact match: {results[0].get('attributes', {}).get('name')}")
+        text = f"🔍 **Search Results for '{aid}'**\n\nChoose a title to download."
+        await status.edit(
+            text,
+            reply_markup=download_results_markup(results[:15], command_name, user_id, ep_arg)
+        )
+        return
     else:
         status = await message.reply_text(f"🔍 Fetching info for {aid}...")
     
@@ -872,7 +977,7 @@ async def dl_cmd(client, message: Message):
     
     series_clean = episodes[0]['series_name']
     # Determine suffix based on command or detection
-    if message.command[0].lower() == "engdl":
+    if command_name == "engdl":
         suffix = "[Dub]"
     else:
         suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
@@ -979,12 +1084,14 @@ async def dl_cmd(client, message: Message):
         await status.delete() # Remove status message when done
 
 @app.on_message(filters.command(["dual", "engvdiddual"]))
-async def dual_cmd(client, message: Message):
+async def dual_cmd(client, message: Message, args_override=None, user_override=None):
     # ... Implementation similar to dl_cmd but for dual audio ...
     # Integrating Global UI and Registry
-    user_id = message.from_user.id
-    user_name = message.from_user.first_name
-    args = message.command
+    user = user_override or message.from_user
+    user_id = user.id
+    user_name = user.first_name
+    args = args_override or message.command
+    command_name = args[0].lower()
     
     if len(args) < 2:
         await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
@@ -1004,6 +1111,13 @@ async def dual_cmd(client, message: Message):
             ep_arg = last_arg
             command_args = command_args[:-1]
 
+    if ep_arg and not re.fullmatch(r'\d+(?:-\d+)?', ep_arg):
+        await message.reply_text("❌ Invalid episode filter. Use: 5 or 1-5")
+        return
+    if not command_args:
+        await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
+        return
+
     if len(command_args) >= 2 and command_args[0].isdigit() and command_args[1].isdigit():
         id1, id2 = command_args[0], command_args[1]
     else:
@@ -1016,7 +1130,11 @@ async def dual_cmd(client, message: Message):
             await status.edit(f"❌ {name_str} doesn't have both Sub and Dub variants for Dual.")
             return
 
-        await status.edit(dual_choice_text(pairs[:15], ep_arg))
+        pairs = pairs[:10]
+        await status.edit(
+            dual_choice_text(pairs),
+            reply_markup=dual_choice_markup(pairs, user_id, ep_arg)
+        )
         return
 
     await setup_tool()
@@ -1029,7 +1147,7 @@ async def dual_cmd(client, message: Message):
         return
 
     # ... (Language mapping logic same as before) ...
-    is_engvdiddual = message.command[0].lower() == "engvdiddual"
+    is_engvdiddual = command_name == "engvdiddual"
     
     if lang1 == "eng" and lang2 != "eng":
         dub_eps, sub_eps = eps1, eps2
@@ -1189,6 +1307,54 @@ async def dual_cmd(client, message: Message):
             shutil.rmtree(task_root, ignore_errors=True)
         await progress_tracker.update_ui()
         await status.delete()
+
+@app.on_callback_query(filters.regex(r'^(dual|download)\|'))
+async def selection_callback(client, callback_query):
+    parts = callback_query.data.split('|')
+
+    try:
+        owner_id = int(parts[-1])
+    except (TypeError, ValueError):
+        await callback_query.answer("Invalid selection.", show_alert=True)
+        return
+
+    if callback_query.from_user.id != owner_id:
+        await callback_query.answer("This selection belongs to another user.", show_alert=True)
+        return
+
+    action = parts[0]
+    if action == "dual" and len(parts) == 6:
+        _, mode, dub_id, sub_id, episode, _ = parts
+        if mode not in ("s", "d") or not dub_id.isdigit() or not sub_id.isdigit():
+            await callback_query.answer("Invalid selection.", show_alert=True)
+            return
+        command = "dual" if mode == "s" else "engvdiddual"
+        args = [command, dub_id, sub_id]
+    elif action == "download" and len(parts) == 5:
+        _, mode, anime_id, episode, _ = parts
+        if mode not in ("d", "e") or not anime_id.isdigit():
+            await callback_query.answer("Invalid selection.", show_alert=True)
+            return
+        command = "dl" if mode == "d" else "engdl"
+        args = [command, anime_id]
+    else:
+        await callback_query.answer("Invalid selection.", show_alert=True)
+        return
+
+    if episode != "_":
+        if not re.fullmatch(r'\d+(?:-\d+)?', episode):
+            await callback_query.answer("Invalid episode filter.", show_alert=True)
+            return
+        args.extend(["-e", episode])
+
+    await callback_query.answer("Starting...")
+    await callback_query.message.edit_text("⏳ Starting your selection...")
+
+    if action == "dual":
+        await dual_cmd(client, callback_query.message, args, callback_query.from_user)
+    else:
+        await dl_cmd(client, callback_query.message, args, callback_query.from_user)
+
 
 if __name__ == "__main__":
     async def main():
