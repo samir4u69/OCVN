@@ -197,6 +197,47 @@ def clean_filename(filename):
 
     return filename
 
+def is_dub_title(title):
+    return bool(re.search(r'\bdub(?:bed|premium)?\b', title, flags=re.IGNORECASE))
+
+
+def variant_base_title(title):
+    """Normalize Dub/Sub variants to the same title for pairing."""
+    title = re.sub(r'\[(?:dub|dubbed|sub|subbed)\]', '', title, flags=re.IGNORECASE)
+    title = re.sub(r'\b(?:dub|dubbed|sub|subbed)\b', '', title, flags=re.IGNORECASE)
+    return clean_filename(title).lower().strip(" -_")
+
+
+def find_dual_pairs(results):
+    grouped = {}
+    for result in results:
+        title = result.get('attributes', {}).get('name', '')
+        result_id = str(result.get('id', ''))
+        if not title or not result_id:
+            continue
+
+        base = variant_base_title(title)
+        group = grouped.setdefault(base, {'title': clean_filename(title), 'dub_id': None, 'sub_id': None})
+        if is_dub_title(title):
+            group['dub_id'] = group['dub_id'] or result_id
+        else:
+            group['sub_id'] = group['sub_id'] or result_id
+
+    return [group for group in grouped.values() if group['dub_id'] and group['sub_id']]
+
+
+def dual_choice_text(pairs, ep_arg=None):
+    episode = f" -e {ep_arg}" if ep_arg else ""
+    lines = ["🎬 **Dual audio is available**", "", "Choose which source you want for the video:", ""]
+    for index, pair in enumerate(pairs, 1):
+        if len(pairs) > 1:
+            lines.append(f"{index}. **{pair['title']}**")
+        lines.append(f"🎞 Sub video: `/dual {pair['dub_id']} {pair['sub_id']}{episode}`")
+        lines.append(f"🎞 Dub video: `/engvdiddual {pair['dub_id']} {pair['sub_id']}{episode}`")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
 def create_short_filename(series_name, episode_num, suffix):
     """Create filename: 'Title - Subtitle - ## [Type].mp4'"""
     series_name = clean_filename(series_name)
@@ -410,12 +451,9 @@ class OCEANVEIL:
             attributes = json_resp['data'].get("attributes", {})
             series_name = attributes.get("name", "Unknown")
             
-            # Robust Language Detection
+            # Detect the variant before cleaning removes the [Dub] marker.
+            is_dub = is_dub_title(series_name)
             series_name_clean = clean_filename(series_name)
-            is_dub = False
-
-            if "dub" in series_name_clean.lower():
-                is_dub = True
             
             lang_code = "eng" if is_dub else "jpn"
             lang_name = "English" if is_dub else "Japanese"
@@ -638,6 +676,7 @@ async def start_cmd(client, message):
         "📥 **Commands:**\n"
         "/dl <id> [ep] - Download episodes\n"
         "/engdl <id> [ep] - Download English dub\n"
+        "/sdl <id/name> [ep] - Smart Dub/Sub selection\n"
         "/dual <id1> <id2> [ep] - Dual Audio (Sub Video)\n"
         "/engvdiddual <id1> <id2> [ep] - Dual Audio (Dub Video)\n"
         "/queue - Show all tasks\n"
@@ -677,7 +716,73 @@ async def cancel_cmd(client, message: Message):
     else:
         await message.reply_text(f"❌ Task ID `{target_id}` not found.")
 
-@app.on_message(filters.command(["dl", "engdl", "sdl"]))
+@app.on_message(filters.command(["sdl"]))
+async def smart_dl_cmd(client, message: Message):
+    args = message.command
+    if len(args) < 2:
+        await message.reply_text("Usage: /sdl <id/name> [-e ep/range]")
+        return
+
+    ep_arg = None
+    if "-e" in args:
+        e_index = args.index("-e")
+        query = " ".join(args[1:e_index])
+        if e_index + 1 < len(args):
+            ep_arg = args[e_index + 1]
+    else:
+        query = " ".join(args[1:])
+
+    if not query:
+        await message.reply_text("Usage: /sdl <id/name> [-e ep/range]")
+        return
+
+    status = await message.reply_text(f"🔍 Looking for Dub and Sub variants of '{query}'...")
+    selected_id = query if query.isdigit() else None
+
+    if selected_id:
+        episodes, _, _, _, lang_code = await ocean.get_episodes(selected_id)
+        if not episodes:
+            await status.edit("❌ Failed to fetch this title.")
+            return
+        search_query = variant_base_title(episodes[0]['series_name'])
+        results = await ocean.search_title(search_query)
+    else:
+        lang_code = None
+        results = await ocean.search_title(query)
+
+    if not results:
+        await status.edit(f"❌ No results found for '{query}'.")
+        return
+
+    pairs = find_dual_pairs(results)
+    if selected_id:
+        pairs = [pair for pair in pairs if selected_id in (pair['dub_id'], pair['sub_id'])]
+
+    if pairs:
+        await status.edit(dual_choice_text(pairs[:15], ep_arg))
+        return
+
+    episode = f" -e {ep_arg}" if ep_arg else ""
+    if selected_id:
+        command = "engdl" if lang_code == "eng" else "dl"
+        await status.edit(
+            "ℹ️ No matching Dub/Sub variant was found.\n\n"
+            f"📥 Download available version: `/{command} {selected_id}{episode}`"
+        )
+        return
+
+    text = f"🔍 **Search Results for '{query}'**\n\n"
+    for index, result in enumerate(results[:15], 1):
+        title = result.get('attributes', {}).get('name', 'Unknown')
+        result_id = result.get('id')
+        command = "engdl" if is_dub_title(title) else "dl"
+        text += f"{index}. **{title}**\n"
+        text += f"└ 📥 Download: `/{command} {result_id}{episode}`\n\n"
+    text += "No matching Dub/Sub pair was found."
+    await status.edit(text)
+
+
+@app.on_message(filters.command(["dl", "engdl"]))
 async def dl_cmd(client, message: Message):
     user_id = message.from_user.id
     user_name = message.from_user.first_name
@@ -885,54 +990,36 @@ async def dual_cmd(client, message: Message):
         await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
         return
 
-    await setup_tool()
-    
     ep_arg = None
-    
-    if "-e" in args:
-        e_index = args.index("-e")
-        name_str = " ".join(args[1:e_index])
-        if e_index + 1 < len(args):
-            ep_arg = args[e_index + 1]
-    else:
-        last_arg = args[-1]
-        if len(args) > 2 and (last_arg.isdigit() or ('-' in last_arg and all(p.isdigit() for p in last_arg.split('-')))):
-            name_str = " ".join(args[1:-1])
+    command_args = args[1:]
+
+    if "-e" in command_args:
+        e_index = command_args.index("-e")
+        if e_index + 1 < len(command_args):
+            ep_arg = command_args[e_index + 1]
+        command_args = command_args[:e_index]
+    elif len(command_args) >= 3:
+        last_arg = command_args[-1]
+        if last_arg.isdigit() or ('-' in last_arg and all(part.isdigit() for part in last_arg.split('-'))):
             ep_arg = last_arg
-        else:
-            name_str = " ".join(args[1:])
-            
-    parts = name_str.split()
-    
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
-        id1, id2 = parts[0], parts[1]
+            command_args = command_args[:-1]
+
+    if len(command_args) >= 2 and command_args[0].isdigit() and command_args[1].isdigit():
+        id1, id2 = command_args[0], command_args[1]
     else:
-        # Search by name for both Sub and Dub
+        name_str = " ".join(command_args)
         status = await message.reply_text(f"🔍 Searching for dual variants of {name_str}...")
         results = await ocean.search_title(name_str)
-        
-        dub_id = None
-        sub_id = None
-        
-        # Clean the search string for comparison
-        clean_search = clean_filename(name_str).lower()
-        
-        for r in results:
-            title = r.get('attributes', {}).get('name', '')
-            clean_t = clean_filename(title).lower()
-            if clean_search in clean_t or clean_t in clean_search:
-                if "dub" in title.lower():
-                    dub_id = r['id']
-                elif "sub" in title.lower() or "dub" not in title.lower():
-                    sub_id = r['id']
-        
-        if not (dub_id and sub_id):
+        pairs = find_dual_pairs(results)
+
+        if not pairs:
             await status.edit(f"❌ {name_str} doesn't have both Sub and Dub variants for Dual.")
             return
-            
-        id1, id2 = dub_id, sub_id
-        await status.delete()
-        
+
+        await status.edit(dual_choice_text(pairs[:15], ep_arg))
+        return
+
+    await setup_tool()
     status = await message.reply_text("🔍 Fetching info...")
     eps1, auth1, cookies1, ua1, lang1 = await ocean.get_episodes(id1)
     eps2, auth2, cookies2, ua2, lang2 = await ocean.get_episodes(id2)
@@ -942,7 +1029,7 @@ async def dual_cmd(client, message: Message):
         return
 
     # ... (Language mapping logic same as before) ...
-    is_engvdiddual = message.command[0] == "engvdiddual"
+    is_engvdiddual = message.command[0].lower() == "engvdiddual"
     
     if lang1 == "eng" and lang2 != "eng":
         dub_eps, sub_eps = eps1, eps2
