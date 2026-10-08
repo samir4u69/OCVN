@@ -18,9 +18,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install N_m3u8DL-RE (linux x64 build)
 RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.5.1-beta/N_m3u8DL-RE_v0.5.1-beta_linux-x64_20251029.tar.gz \
     && tar -xzf N_m3u8DL-RE_v0.5.1-beta_linux-x64_20251029.tar.gz \
-    && mv N_m3u8DL-RE /usr/local/bin/N_m3u8DL-RE \
+    && find . -name "N_m3u8DL-RE" -type f -exec mv {} /usr/local/bin/N_m3u8DL-RE \; \
     && chmod +x /usr/local/bin/N_m3u8DL-RE \
-    && rm -rf N_m3u8DL-RE_v0.5.1-beta_linux-x64_20251029.tar.gz
+    && rm -rf N_m3u8DL-RE_v0.5.1-beta_linux-x64_20251029*
 
 # Optional but recommended: non-root user
 RUN useradd -m appuser
