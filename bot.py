@@ -34,6 +34,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 # OceanVeil Vars
 OV_EMAIL = os.environ.get("OV_EMAIL")
 OV_PASSWORD = os.environ.get("OV_PASSWORD")
+PROXY = os.environ.get("PROXY")
 
 # Check Config
 if not all([API_ID, API_HASH, BOT_TOKEN, OV_EMAIL, OV_PASSWORD]):
@@ -190,6 +191,9 @@ def clean_filename(filename):
     
     # Remove characters that might confuse parsers or look weird
     filename = filename.replace('…', '').replace('～', '-')
+    
+    # Remove Windows invalid characters
+    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
 
     return filename
 
@@ -322,10 +326,13 @@ class OCEANVEIL:
 
     async def get_session(self):
         if self.session is None:
-            self.session = AsyncSession(
-                impersonate="chrome", 
-                headers={"User-Agent": self.user_agent}
-            )
+            kwargs = {
+                "impersonate": "chrome", 
+                "headers": {"User-Agent": self.user_agent}
+            }
+            if PROXY:
+                kwargs["proxies"] = {"http": PROXY, "https": PROXY}
+            self.session = AsyncSession(**kwargs)
         return self.session
 
     async def login(self):
@@ -351,6 +358,28 @@ class OCEANVEIL:
                 logger.error(f"Login error: {e}")
                 return False
 
+    async def search_title(self, query):
+        session = await self.get_session()
+        try:
+            res = await session.get(
+                "https://oceanveil.net/api/v1/anime_titles",
+                headers={"authorization": self.auth_header} if self.auth_header else {}
+            )
+            if res.status_code == 200:
+                data = res.json().get('data', [])
+                # Filter locally since API search is broken
+                q = str(query).lower()
+                results = []
+                for item in data:
+                    name = item.get('attributes', {}).get('name', '')
+                    promo = item.get('attributes', {}).get('promotionName', '') or ''
+                    if q in name.lower() or q in promo.lower():
+                        results.append(item)
+                return results
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+        return []
+
     async def get_episodes(self, id):
         if not self.auth_header:
             if not await self.login(): 
@@ -365,6 +394,14 @@ class OCEANVEIL:
             res = await session.get(
                 url, headers={"authorization": self.auth_header}, cookies=self.cookies
             )
+            if res.status_code == 401 or res.status_code == 403:
+                logger.info("Token expired, attempting re-login...")
+                self.auth_header = None
+                if await self.login():
+                    res = await session.get(
+                        url, headers={"authorization": self.auth_header}, cookies=self.cookies
+                    )
+                    
             if res.status_code != 200:
                 logger.error(f"Failed to fetch episodes: {res.status_code}")
                 return [], None, None, None, None
@@ -640,30 +677,31 @@ async def cancel_cmd(client, message: Message):
     else:
         await message.reply_text(f"❌ Task ID `{target_id}` not found.")
 
-@app.on_message(filters.command(["dl", "engdl"]))
+@app.on_message(filters.command(["dl", "engdl", "sdl"]))
 async def dl_cmd(client, message: Message):
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     args = message.command
     
     if len(args) < 2:
-        await message.reply_text("Usage: /dl <id> [-e ep/range]")
+        await message.reply_text("Usage: /dl <id/name> [-e ep/range]")
         return
     
-    aid = args[1]
     ep_filter = None
-    
-    # Parse arguments
     ep_arg = None
+    
     if "-e" in args:
-        try:
-            e_index = args.index("-e")
-            if e_index + 1 < len(args):
-                ep_arg = args[e_index + 1]
-        except ValueError:
-            pass
-    elif len(args) >= 3:
-        ep_arg = args[2]
+        e_index = args.index("-e")
+        aid = " ".join(args[1:e_index])
+        if e_index + 1 < len(args):
+            ep_arg = args[e_index + 1]
+    else:
+        last_arg = args[-1]
+        if len(args) > 2 and (last_arg.isdigit() or ('-' in last_arg and all(p.isdigit() for p in last_arg.split('-')))):
+            aid = " ".join(args[1:-1])
+            ep_arg = last_arg
+        else:
+            aid = " ".join(args[1:])
 
     if ep_arg:
         if '-' in ep_arg:
@@ -680,8 +718,33 @@ async def dl_cmd(client, message: Message):
             except:
                 await message.reply_text("❌ Invalid episode number.")
                 return
-    
-    status = await message.reply_text(f"🔍 Fetching info for {aid}...")
+                
+    if not aid.isdigit():
+        status = await message.reply_text(f"🔍 Searching for '{aid}'...")
+        results = await ocean.search_title(aid)
+        if not results:
+            await status.edit(f"❌ No results found for '{aid}'.")
+            return
+            
+        if len(results) > 1:
+            # Show search results!
+            text = f"🔍 **Search Results for '{aid}'**\n\n"
+            for idx, r in enumerate(results[:15]):
+                name = r.get('attributes', {}).get('name', 'Unknown')
+                r_id = r.get('id')
+                # Determine command based on alias
+                cmd = message.command[0]
+                text += f"{idx+1}. **{name}**\n"
+                text += f"└ 📥 Download: `/{cmd} {r_id}`\n\n"
+            text += "Please click a download command above to start."
+            await status.edit(text)
+            return
+            
+        # If exactly 1 result, proceed with it
+        aid = results[0]['id']
+        await status.edit(f"✅ Found exact match: {results[0].get('attributes', {}).get('name')}")
+    else:
+        status = await message.reply_text(f"🔍 Fetching info for {aid}...")
     
     # We do setup_tool here to ensure it's ready, but now it's locked.
     await setup_tool()
@@ -818,16 +881,58 @@ async def dual_cmd(client, message: Message):
     user_name = message.from_user.first_name
     args = message.command
     
-    if len(args) < 3:
+    if len(args) < 2:
         await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
         return
 
     await setup_tool()
     
-    # ... (Argument Parsing same as dl_cmd) ...
-    # Simplified for this block:
-    id1, id2 = args[1], args[2]
+    ep_arg = None
     
+    if "-e" in args:
+        e_index = args.index("-e")
+        name_str = " ".join(args[1:e_index])
+        if e_index + 1 < len(args):
+            ep_arg = args[e_index + 1]
+    else:
+        last_arg = args[-1]
+        if len(args) > 2 and (last_arg.isdigit() or ('-' in last_arg and all(p.isdigit() for p in last_arg.split('-')))):
+            name_str = " ".join(args[1:-1])
+            ep_arg = last_arg
+        else:
+            name_str = " ".join(args[1:])
+            
+    parts = name_str.split()
+    
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+        id1, id2 = parts[0], parts[1]
+    else:
+        # Search by name for both Sub and Dub
+        status = await message.reply_text(f"🔍 Searching for dual variants of {name_str}...")
+        results = await ocean.search_title(name_str)
+        
+        dub_id = None
+        sub_id = None
+        
+        # Clean the search string for comparison
+        clean_search = clean_filename(name_str).lower()
+        
+        for r in results:
+            title = r.get('attributes', {}).get('name', '')
+            clean_t = clean_filename(title).lower()
+            if clean_search in clean_t or clean_t in clean_search:
+                if "dub" in title.lower():
+                    dub_id = r['id']
+                elif "sub" in title.lower() or "dub" not in title.lower():
+                    sub_id = r['id']
+        
+        if not (dub_id and sub_id):
+            await status.edit(f"❌ {name_str} doesn't have both Sub and Dub variants for Dual.")
+            return
+            
+        id1, id2 = dub_id, sub_id
+        await status.delete()
+        
     status = await message.reply_text("🔍 Fetching info...")
     eps1, auth1, cookies1, ua1, lang1 = await ocean.get_episodes(id1)
     eps2, auth2, cookies2, ua2, lang2 = await ocean.get_episodes(id2)
@@ -869,19 +974,16 @@ async def dual_cmd(client, message: Message):
         video_id, audio_id = sub_id, dub_id
 
     # Filter episodes
-    if "-e" in args:
+    if ep_arg:
         try:
-            e_index = args.index("-e")
-            if e_index + 1 < len(args):
-                ep_arg = args[e_index + 1]
-                if '-' in ep_arg:
-                    start, end = map(int, ep_arg.split('-'))
-                    video_eps = [ep for ep in video_eps if start <= int(ep['ep_num']) <= end]
-                    audio_eps = [ep for ep in audio_eps if start <= int(ep['ep_num']) <= end]
-                else:
-                    ep_num = int(ep_arg)
-                    video_eps = [ep for ep in video_eps if int(ep['ep_num']) == ep_num]
-                    audio_eps = [ep for ep in audio_eps if int(ep['ep_num']) == ep_num]
+            if '-' in ep_arg:
+                start, end = map(int, ep_arg.split('-'))
+                video_eps = [ep for ep in video_eps if start <= int(ep['ep_num']) <= end]
+                audio_eps = [ep for ep in audio_eps if start <= int(ep['ep_num']) <= end]
+            else:
+                ep_num = int(ep_arg)
+                video_eps = [ep for ep in video_eps if int(ep['ep_num']) == ep_num]
+                audio_eps = [ep for ep in audio_eps if int(ep['ep_num']) == ep_num]
         except:
             await message.reply_text("❌ Invalid episode filter")
             return
