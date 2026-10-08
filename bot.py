@@ -224,6 +224,27 @@ def search_match_score(query, candidate):
     return max(ratio, coverage)
 
 
+def rank_search_results(query, titles):
+    scored = []
+    for index, item in enumerate(titles):
+        attributes = item.get('attributes', {})
+        candidates = [
+            attributes.get('name', ''),
+            attributes.get('japaneseName', '') or '',
+            attributes.get('romajiName', '') or '',
+            attributes.get('promotionName', '') or ''
+        ]
+        score = max(search_match_score(query, candidate) for candidate in candidates)
+        if score:
+            scored.append((score, index, item))
+
+    scored.sort(key=lambda match: (-match[0], match[1]))
+    strong_matches = [item for score, _, item in scored if score >= 55]
+    if strong_matches:
+        return strong_matches[:30]
+    return [item for _, _, item in scored[:15]]
+
+
 def is_dub_title(title):
     return bool(re.search(r'\bdub(?:bed|premium)?\b', title, flags=re.IGNORECASE))
 
@@ -507,24 +528,45 @@ class OCEANVEIL:
                     break
                 url = next_url
 
-            scored = []
-            for index, item in enumerate(titles):
-                attributes = item.get('attributes', {})
-                candidates = [
-                    attributes.get('name', ''),
-                    attributes.get('promotionName', '') or ''
+            initial_matches = rank_search_results(query, titles)
+
+            async def fetch_related_titles(item):
+                item_id = str(item.get('id', ''))
+                if not item_id.isdigit():
+                    return []
+                detail_url = (
+                    f"https://oceanveil.net/api/v1/anime_titles/{item_id}"
+                    "?include%5B%5D=season_anime_titles"
+                    "&include%5B%5D=mature_title"
+                    "&include%5B%5D=general_title"
+                )
+                response = await session.get(
+                    detail_url,
+                    headers={"authorization": self.auth_header},
+                    cookies=self.cookies
+                )
+                if response.status_code != 200:
+                    return []
+                return [
+                    related for related in response.json().get('included', [])
+                    if related.get('type') == 'animeTitle'
                 ]
-                score = max(search_match_score(query, candidate) for candidate in candidates)
-                if score:
-                    scored.append((score, index, item))
 
-            scored.sort(key=lambda match: (-match[0], match[1]))
-            strong_matches = [item for score, _, item in scored if score >= 55]
-            if strong_matches:
-                return strong_matches[:30]
+            related_batches = await asyncio.gather(
+                *(fetch_related_titles(item) for item in initial_matches[:10]),
+                return_exceptions=True
+            )
+            for batch in related_batches:
+                if isinstance(batch, Exception):
+                    logger.debug(f"Related-title search failed: {batch}")
+                    continue
+                for item in batch:
+                    item_id = str(item.get('id', ''))
+                    if item_id and item_id not in seen_ids:
+                        seen_ids.add(item_id)
+                        titles.append(item)
 
-            # Force-match the closest titles when no normal match exists.
-            return [item for _, _, item in scored[:15]]
+            return rank_search_results(query, titles)
         except Exception as e:
             logger.error(f"Search error: {e}")
             return []
